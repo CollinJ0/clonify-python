@@ -37,6 +37,10 @@ parser.add_argument('-d', '--db', dest='db', required=True,
 					help="The MongoDB database to be queried. Required.")
 parser.add_argument('-c', '--coll', dest='coll', default=None,
 					help="The MongoDB collection to be queried. If ommitted, all collections in the database will be processed.")
+parser.add_argument('-r', '--pool_split_by', dest='pool_split_by', default=None,
+					help="The delimiter by which to split names of collections and pool for lineage assignment")
+parser.add_argument('-q', '--pool_seqs', action='store_true', default=False, dest='pool_seqs',
+					help="The MongoDB collection to be queried. If ommitted, all collections in the database will be processed.")
 parser.add_argument('-i', '--ip', dest='ip', default='localhost',
 					help="The IP address of the MongoDB server. Defaults to 'localhost'.")
 parser.add_argument('-p', '--port', dest='port', default=27017, type=int,
@@ -44,8 +48,8 @@ parser.add_argument('-p', '--port', dest='port', default=27017, type=int,
 parser.add_argument('-o', '--out', dest='output', default='',
 					help="Directory for the output files. Files will be named '<collection>_clones.txt'. \
 					Failing to provide an output directory will result in no output files being written.")
-parser.add_argument('-s', '--split_by', dest='split_by', default='none', choices=['none', 'fam', 'gene'],
-					help="Define how to split the input sequence pool. Choices are 'fam' and 'gene'. \
+parser.add_argument('-s', '--split_by', dest='split_by', default='none', choices=['none', 'fam', 'gene', 'vjcdr3len'],
+					help="Define how to split the input sequence pool. Choices are 'fam', 'gene' and 'vjcdr3len'. \
 					Splitting by 'gene' may cause a small number of false negatives due to IgBLAST germline misassignment, \
 					but can provide large reductions in processing time and memory use. Default is 'fam'.")
 parser.add_argument('-t', '--threads', dest='threads', type=int, default=None,
@@ -90,15 +94,18 @@ class Seq(object):
 		# self.j_all = data['j_gene']['all']
 		self.junc = data[junc_query]
 		self.junc_len = len(self.junc)
-		self.muts = []
-		if 'var_muts_nt' in data.keys():
-			self.muts = ['{}{}'.format(d['loc'], d['mut']) for d in data['var_muts_nt']['muts']]
+                self.muts = []
+                if 'var_muts_nt' in data.keys():
+                        self.muts = ['{}{}'.format(d['position'], d['is']) for d in data['var_muts_nt']['muts']]
 
 	def v_gene_string(self):
 		return 'v{0}-{1}'.format(self.v_fam, self.v_gene)
 
 	def v_fam_string(self):
 		return 'v{0}'.format(self.v_fam)
+	
+	def vjcdr3_string(self):
+		return 'v{0}-{1}-j{2}-cdr3{3}'.format(self.v_fam, self.v_gene, self.j_gene, self.junc_len)
 
 
 
@@ -193,11 +200,33 @@ def get_seqs(database, collection):
 	results = c.find({'chain': 'heavy'},
 					 {'_id': 0, 'seq_id': 1, 'v_gene': 1, 'j_gene': 1, junc_query: 1, 'var_muts_nt': 1})
 	output = []
+
 	for r in results:
 		if r is not None:
 			if junc_query not in r.keys():
 				continue
 			output.append(Seq(r, junc_query))
+
+	return output
+
+def get_pooled_seqs(database, collections):
+	if args.is_aa:
+		junc_query = 'junc_aa'
+	else:
+		junc_query = 'junc_nt'
+	conn = MongoClient(args.ip, args.port)
+	db = conn[database]
+	output = []
+	for collection in collections:
+		c = db[collection]
+
+		results = c.find({'chain': 'heavy'},
+						{'_id': 0, 'seq_id': 1, 'v_gene': 1, 'j_gene': 1, junc_query: 1, 'var_muts_nt': 1})
+		for r in results:
+			if r is not None:
+				if junc_query not in r.keys():
+					continue
+				output.append(Seq(r, junc_query))
 	return output
 
 
@@ -208,6 +237,16 @@ def get_collections():
 	db = conn[args.db]
 	subjects = db.collection_names(include_system_collections=False)
 	return sorted(subjects)
+
+def split_list_into_dict(l, d):
+	#returns dictionary of lists of sequences that will b e processed together
+    k = [i.split(d)[0] for i in l]
+    di = {}
+    for i in k:
+        print(i)
+        di[i] = [p for p in l if i in p]
+        
+    return di
 
 
 def update_db(database, collection, clusters):
@@ -248,12 +287,12 @@ def count_cpus():
 
 def split_by_gene(seqs):
 	'''
-	Splits sequences by variable gene.
+	Splits sequences by variable gene, join gene and cdr3 length.
 	Returns a dict with var genes as keys, seqs as values.
 	'''
 	split = {}
 	for seq in seqs:
-		if seq.v_gene_string() in split:
+		if seq.v_gene_string() + str(seq.j_gene) + str(seq.junc_len) in split:
 			split[seq.v_gene_string()].append(seq)
 		else:
 			split[seq.v_gene_string()] = [seq, ]
@@ -272,6 +311,19 @@ def split_by_fam(seqs):
 		else:
 			split[seq.v_fam_string()] = [seq, ]
 	return split
+
+def split_by_vjcdr3(seqs):
+	'''
+	Splits sequences by vgene, jgene and cdr3 len .
+	Returns a dict with vjcdr3len as keys, seqs as values.
+	'''
+	split = {}
+	for seq in seqs:
+		if seq.vjcdr3_string() in split:
+			split[seq.vjcdr3_string()].append(seq)
+		else:
+			split[seq.vjcdr3_string()] = [seq, ]
+	return split	
 
 
 def get_chunksize(input):
@@ -391,6 +443,63 @@ def analyze_collection(coll):
 		split_seqs = split_by_gene(seqs)
 	elif args.split_by == 'fam':
 		split_seqs = split_by_fam(seqs)
+	elif args.split_by == 'vjcdr3len':
+		print "Splitting seqs by vjcdr3len"
+		split_seqs = split_by_vjcdr3(seqs)
+	else:
+		split_seqs = {'v0': seqs}
+
+	# clonify
+	print_clonify_start()
+	clusters = {}
+	for vh in sorted(split_seqs.keys()):
+		if len(split_seqs[vh]) <= 1:
+			continue
+		print_vh_info(vh)
+		clusters.update(make_clusters(split_seqs[vh], vh))
+	print_clonify_end()
+	clonifyEnd = time.time()
+
+	# update MongoDB
+	if args.update:
+		print_update_start()
+	else:
+		print_no_update()
+	cluster_stats = update_db(args.db, coll, clusters)
+	print_update_end()
+	updateEnd = time.time()
+
+	# write output
+	if args.output != '':
+		print_write_start()
+		write_output(args.output, coll, clusters)
+		print_write_end()
+	else:
+		print_write_null()
+	print_run_summary(cluster_stats, startTime, queryEnd, clonifyEnd, updateEnd, len(seqs))
+
+def analyze_pooled_collections(pcs):
+	'''
+	Control function for complete processing of a single MongoDB collection.
+	'''
+	# query
+	startTime = time.time()
+	print_query_start_pooled(pcs)
+	seqs = get_pooled_seqs(args.db, pcs)
+	print_query_end(len(seqs))
+	queryEnd = time.time()
+
+
+	# seq splitting
+	if len(seqs) < 2:
+		return False
+	if args.split_by == 'gene':
+		split_seqs = split_by_gene(seqs)
+	elif args.split_by == 'fam':
+		split_seqs = split_by_fam(seqs)
+	elif args.split_by == 'vjcdr3len':
+		print "Splitting seqs by vjcdr3len"
+		split_seqs = split_by_vjcdr3(seqs)
 	else:
 		split_seqs = {'v0': seqs}
 
@@ -426,6 +535,7 @@ def analyze_collection(coll):
 
 
 
+
 # -----------------------------
 #       WRITING/PRINTING
 # -----------------------------
@@ -453,6 +563,17 @@ def print_query_start(collection):
 	print '========================================'
 	print ''
 	print 'Querying MongoDB (db: {0}, collection: {1}) for the input sequences...'.format(args.db, collection)
+
+def print_query_start_pooled(collections):
+	print ''
+	print ''
+	print '========================================'
+	print 'Pooling and processing collections:'
+	for c in collections:
+		print '{0}'.format(c)
+	print '========================================'
+	print ''
+	print 'Querying MongoDB (db: {0}) for the input sequences...'.format(args.db)
 
 
 def print_vh_info(vh):
@@ -514,8 +635,21 @@ def print_run_summary(stats, startTime, queryEnd, clonifyEnd, updateEnd, total_c
 
 
 def main():
-	for c in get_collections():
-		analyze_collection(c)
+	if args.pool_seqs:
+		pc = [c for c in get_collections()]
+		analyze_pooled_collections(pc)
+	elif args.pool_split_by:
+		delim = args.pool_split_by
+		print('YOU HAVE ACTIVATED SPLIT AND POOL COLLECTIONS BY THE DELIMITER: {}'.format(delim))
+		c = get_collections():
+		c_dict = split_list_into_dict(c, delim)
+		for key in c_dict.keys():
+			print('Analyzing pool: {}'.format(key))
+			pc = c_dict[key]
+			analyze_pooled_collections(pc)
+	else:
+		for c in get_collections():
+			analyze_collection(c)
 
 if __name__ == '__main__':
 	main()
